@@ -284,6 +284,11 @@ module Spaceship
       all_reviews
     end
 
+    def get_latest_reviews(app_id, platform, storefront, versionId = '')
+      r = request(:get, "ra/apps/#{app_id}/platforms/#{platform}/reviews?storefront=#{storefront}&versionId=#{versionId}")
+      parse_response(r, 'data')['reviews']
+    end
+
     #####################################################
     # @!group AppVersions
     #####################################################

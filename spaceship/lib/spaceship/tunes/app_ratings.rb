@@ -51,6 +51,14 @@ module Spaceship
           AppReview.factory(review["value"])
         end
       end
+
+      def latest_reviews(store_front, versionId = '')
+        raw_reviews = client.get_latest_reviews(application.apple_id, application.platform, store_front, versionId)
+        raw_reviews.map do |review|
+          review["value"]["application"] = self.application
+          AppReview.factory(review["value"])
+        end
+      end
     end
 
     class DeveloperResponse < TunesBase
