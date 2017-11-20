@@ -45,6 +45,13 @@ module Spaceship::TestFlight
 
     attr_accessor :upload_date
 
+    attr_accessor :dsym_url
+    attr_accessor :build_sdk
+    attr_accessor :include_symbols
+    attr_accessor :number_of_asset_packs
+    attr_accessor :contains_odr
+    attr_accessor :file_name
+
     attr_mapping({
       'appAdamId' => :app_id,
       'providerId' => :provider_id,
@@ -61,7 +68,13 @@ module Spaceship::TestFlight
       'crashCount' => :crash_count,
       'didNotify' => :did_notify,
       'uploadDate' => :upload_date,
-      'id' => :id
+      'id' => :id,
+      'dSYMUrl' => :dsym_url,
+      'buildSdk' => :build_sdk,
+      'includesSymbols' => :include_symbols,
+      'numberOfAssetPacks' => :number_of_asset_packs,
+      'containsODR' => :contains_odr,
+      'fileName' => :file_name
     })
 
     BUILD_STATES = {
@@ -69,7 +82,8 @@ module Spaceship::TestFlight
       active: 'testflight.build.state.testing.active',
       ready_to_submit: 'testflight.build.state.submit.ready',
       ready_to_test: 'testflight.build.state.testing.ready',
-      export_compliance_missing: 'testflight.build.state.export.compliance.missing'
+      export_compliance_missing: 'testflight.build.state.export.compliance.missing',
+      review_rejected: 'testflight.build.state.review.rejected'
     }
 
     # Find a Build by `build_id`.
@@ -80,19 +94,19 @@ module Spaceship::TestFlight
       self.new(attrs)
     end
 
-    def self.all(app_id: nil, platform: nil)
-      trains = BuildTrains.all(app_id: app_id, platform: platform)
+    def self.all(app_id: nil, platform: nil, retry_count: 0)
+      trains = BuildTrains.all(app_id: app_id, platform: platform, retry_count: retry_count)
       trains.values.flatten
     end
 
-    def self.builds_for_train(app_id: nil, platform: nil, train_version: nil, retry_count: 0)
+    def self.builds_for_train(app_id: nil, platform: nil, train_version: nil, retry_count: 3)
       builds_data = client.get_builds_for_train(app_id: app_id, platform: platform, train_version: train_version, retry_count: retry_count)
       builds_data.map { |data| self.new(data) }
     end
 
     # Just the builds, as a flat array, that are still processing
-    def self.all_processing_builds(app_id: nil, platform: nil)
-      all(app_id: app_id, platform: platform).find_all(&:processing?)
+    def self.all_processing_builds(app_id: nil, platform: nil, retry_count: 0)
+      all(app_id: app_id, platform: platform, retry_count: retry_count).find_all(&:processing?)
     end
 
     def self.latest(app_id: nil, platform: nil)
@@ -130,13 +144,17 @@ module Spaceship::TestFlight
       external_state == BUILD_STATES[:export_compliance_missing]
     end
 
+    def review_rejected?
+      external_state == BUILD_STATES[:review_rejected]
+    end
+
     def processed?
-      active? || ready_to_submit? || export_compliance_missing?
+      active? || ready_to_submit? || export_compliance_missing? || review_rejected?
     end
 
     # Getting builds from BuildTrains only gets a partial Build object
     # We are then requesting the full build from iTC when we need to access
-    # any of the variables below, because they are not inlcuded in the partial Build objects
+    # any of the variables below, because they are not included in the partial Build objects
     #
     # `super` here calls `beta_review_info` as defined by the `attr_mapping` above.
     # @return (Spaceship::TestFlight::BetaReviewInfo)
@@ -177,6 +195,10 @@ module Spaceship::TestFlight
     def submit_for_testflight_review!
       return if ready_to_test?
       client.post_for_testflight_review(app_id: app_id, build_id: id, build: self)
+    end
+
+    def expire!
+      client.expire_build(app_id: app_id, build_id: id, build: self)
     end
 
     def add_group!(group)

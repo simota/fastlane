@@ -36,6 +36,7 @@ module Fastlane
         flags = []
         flags << "-p #{project_dir.shellescape}"
         flags << params[:properties].map { |k, v| "-P#{k.to_s.shellescape}=#{v.to_s.shellescape}" }.join(' ') unless params[:properties].nil?
+        flags << params[:system_properties].map { |k, v| "-D#{k.to_s.shellescape}=#{v.to_s.shellescape}" }.join(' ') unless params[:system_properties].nil?
         flags << params[:flags] unless params[:flags].nil?
 
         # Run the actual gradle task
@@ -55,7 +56,7 @@ module Fastlane
         # If we didn't build, then we return now, as it makes no sense to search for apk's in a non-`assemble` scenario
         return result unless task =~ /\b(assemble)/
 
-        apk_search_path = File.join(project_dir, '**', 'build', 'outputs', 'apk', '*.apk')
+        apk_search_path = File.join(project_dir, '**', 'build', 'outputs', 'apk', '**', '*.apk')
 
         # Our apk is now built, but there might actually be multiple ones that were built if a flavor was not specified in a multi-flavor project (e.g. `assembleRelease`), however we're not interested in unaligned apk's...
         new_apks = Dir[apk_search_path].reject { |path| path =~ /^.*-unaligned.apk$/i }
@@ -125,6 +126,11 @@ module Fastlane
                                        description: 'Gradle properties to be exposed to the gradle script',
                                        optional: true,
                                        is_string: false),
+          FastlaneCore::ConfigItem.new(key: :system_properties,
+                                       env_name: 'FL_GRADLE_SYSTEM_PROPERTIES',
+                                       description: 'Gradle system properties to be exposed to the gradle script',
+                                       optional: true,
+                                       is_string: false),
           FastlaneCore::ConfigItem.new(key: :serial,
                                        env_name: 'FL_ANDROID_SERIAL',
                                        description: 'Android serial, which device should be used for this command',
@@ -161,7 +167,7 @@ module Fastlane
       end
 
       def self.is_supported?(platform)
-        platform == :android || platform == :ios
+        [:ios, :android].include?(platform) # we support iOS as cross platforms apps might want to call `gradle` also
       end
 
       def self.example_code
@@ -179,8 +185,23 @@ module Fastlane
               "versionName" => "1.0.0",
               # ...
             }
+          )
+          ```
+
+          You can use this to automatically [sign and zipalign](https://developer.android.com/studio/publish/app-signing.html) your app:
+          ```ruby
+          gradle(
+            task: "assemble",
+            build_type: "Release",
+            print_command: false,
+            properties: {
+              "android.injected.signing.store.file" => "keystore.jks",
+              "android.injected.signing.store.password" => "store_password",
+              "android.injected.signing.key.alias" => "key_alias",
+              "android.injected.signing.key.password" => "key_password",
+            }
           )',
-          '# If you need to pass sensitive information through the `gradle` action, and don"t want the generated command to be printed before it is run, you can suppress that:
+          '# If you need to pass sensitive information through the `gradle` action, and don\'t want the generated command to be printed before it is run, you can suppress that:
           gradle(
             # ...
             print_command: false

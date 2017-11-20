@@ -35,7 +35,13 @@ module Pilot
       end
 
       UI.message("If you want to skip waiting for the processing to be finished, use the `skip_waiting_for_build_processing` option")
-      latest_build = FastlaneCore::BuildWatcher.wait_for_build_processing_to_be_complete(app_id: app.apple_id, platform: platform, poll_interval: config[:wait_processing_interval])
+      app_version = FastlaneCore::IpaFileAnalyser.fetch_app_version(config[:ipa])
+      app_build = FastlaneCore::IpaFileAnalyser.fetch_app_build(config[:ipa])
+      latest_build = FastlaneCore::BuildWatcher.wait_for_build_processing_to_be_complete(app_id: app.apple_id, platform: platform, train_version: app_version, build_version: app_build, poll_interval: config[:wait_processing_interval], strict_build_watch: config[:wait_for_uploaded_build])
+
+      unless latest_build.train_version == app_version && latest_build.build_version == app_build
+        UI.important("Uploaded app #{app_version} - #{app_build}, but received build #{latest_build.train_version} - #{latest_build.build_version}. If you want to wait for uploaded build to be finished processing, use the `wait_for_uploaded_build` option")
+      end
 
       distribute(options, build: latest_build)
     end
@@ -134,23 +140,26 @@ module Pilot
       # This is where we could add a check to see if encryption is required and has been updated
       uploaded_build.export_compliance.encryption_updated = false
 
-      if options[:distribute_external]
+      if options[:groups] || options[:distribute_external]
         uploaded_build.beta_review_info.demo_account_required = false
         uploaded_build.submit_for_testflight_review!
+      end
+
+      if options[:groups]
+        groups = Spaceship::TestFlight::Group.filter_groups(app_id: uploaded_build.app_id) do |group|
+          options[:groups].include?(group.name)
+        end
+        groups.each do |group|
+          uploaded_build.add_group!(group)
+        end
+      end
+
+      if options[:distribute_external]
         external_group = Spaceship::TestFlight::Group.default_external_group(app_id: uploaded_build.app_id)
         uploaded_build.add_group!(external_group) unless external_group.nil?
 
         if external_group.nil? && options[:groups].nil?
           UI.user_error!("You must specify at least one group using the `:groups` option to distribute externally")
-        end
-
-        if options[:groups]
-          groups = Spaceship::TestFlight::Group.filter_groups(app_id: uploaded_build.app_id) do |group|
-            options[:groups].include?(group.name)
-          end
-          groups.each do |group|
-            uploaded_build.add_group!(group)
-          end
         end
       else # distribute internally
         # in case any changes to export_compliance are required

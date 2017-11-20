@@ -2,13 +2,13 @@ module Deliver
   # upload description, rating, etc.
   class UploadMetadata
     # All the localised values attached to the version
-    LOCALISED_VERSION_VALUES = [:description, :keywords, :release_notes, :support_url, :marketing_url]
+    LOCALISED_VERSION_VALUES = [:description, :keywords, :release_notes, :support_url, :marketing_url, :promotional_text]
 
     # Everything attached to the version but not being localised
     NON_LOCALISED_VERSION_VALUES = [:copyright]
 
     # Localised app details values
-    LOCALISED_APP_VALUES = [:name, :privacy_url]
+    LOCALISED_APP_VALUES = [:name, :subtitle, :privacy_url]
 
     # Non localized app details values
     NON_LOCALISED_APP_VALUES = [:primary_category, :secondary_category,
@@ -54,6 +54,10 @@ module Deliver
 
     # Directory name it contains review information
     REVIEW_INFORMATION_DIR = "review_information"
+
+    ALL_META_SUB_DIRS = [TRADE_REPRESENTATIVE_CONTACT_INFORMATION_DIR, REVIEW_INFORMATION_DIR]
+
+    # rubocop:disable Metrics/PerceivedComplexity
 
     # Make sure to call `load_from_filesystem` before calling upload
     def upload(options)
@@ -111,6 +115,8 @@ module Deliver
       end
 
       v.release_on_approval = options[:automatic_release]
+      v.auto_release_date = options[:auto_release_date] unless options[:auto_release_date].nil?
+      v.toggle_phased_release(enabled: !!options[:phased_release]) unless options[:phased_release].nil?
 
       set_trade_representative_contact_information(v, options)
       set_review_information(v, options)
@@ -118,14 +124,30 @@ module Deliver
 
       UI.message("Uploading metadata to iTunes Connect")
       v.save!
-      details.save!
-      UI.success("Successfully uploaded set of metadata to iTunes Connect")
+      begin
+        details.save!
+        UI.success("Successfully uploaded set of metadata to iTunes Connect")
+      rescue Spaceship::TunesClient::ITunesConnectError => e
+        # This makes sure that we log invalid app names as user errors
+        # If another string needs to be checked here we should
+        # figure out a more generic way to handle these cases.
+        if e.message.include?('App Name cannot be longer than 50 characters') || e.message.include?('The app name you entered is already being used')
+          UI.user_error!(e.message)
+        else
+          raise e
+        end
+      end
     end
+
+    # rubocop:enable Metrics/PerceivedComplexity
 
     # If the user is using the 'default' language, then assign values where they are needed
     def assign_defaults(options)
+      # Normalizes languages keys from symbols to strings
+      normalize_language_keys(options)
+
       # Build a complete list of the required languages
-      enabled_languages = []
+      enabled_languages = detect_languages(options)
 
       # Get all languages used in existing settings
       (LOCALISED_VERSION_VALUES + LOCALISED_APP_VALUES).each do |key|
@@ -137,10 +159,10 @@ module Deliver
       end
 
       # Check folder list (an empty folder signifies a language is required)
-      Loader.language_folders(options[:metadata_path]).each do |lng_folder|
-        next unless File.directory?(lng_folder) # We don't want to read txt as they are non localised
-
-        language = File.basename(lng_folder)
+      ignore_validation = options[:ignore_language_directory_validation]
+      Loader.language_folders(options[:metadata_path], ignore_validation).each do |lang_folder|
+        next unless File.directory?(lang_folder) # We don't want to read txt as they are non localised
+        language = File.basename(lang_folder)
         enabled_languages << language unless enabled_languages.include?(language)
       end
 
@@ -164,6 +186,34 @@ module Deliver
       end
     end
 
+    def detect_languages(options)
+      # Build a complete list of the required languages
+      enabled_languages = options[:languages] || []
+
+      # Get all languages used in existing settings
+      (LOCALISED_VERSION_VALUES + LOCALISED_APP_VALUES).each do |key|
+        current = options[key]
+        next unless current && current.kind_of?(Hash)
+        current.each do |language, value|
+          enabled_languages << language unless enabled_languages.include?(language)
+        end
+      end
+
+      # Check folder list (an empty folder signifies a language is required)
+      ignore_validation = options[:ignore_language_directory_validation]
+      Loader.language_folders(options[:metadata_path], ignore_validation).each do |lang_folder|
+        next unless File.directory?(lang_folder) # We don't want to read txt as they are non localised
+
+        language = File.basename(lang_folder)
+        enabled_languages << language unless enabled_languages.include?(language)
+      end
+
+      # Mapping to strings because :default symbol can be passed in
+      enabled_languages
+        .map(&:to_s)
+        .uniq
+    end
+
     # Makes sure all languages we need are actually created
     def verify_available_languages!(options)
       return if options[:skip_metadata]
@@ -174,14 +224,21 @@ module Deliver
       v = options[:app].edit_version
       UI.user_error!("Could not find a version to edit for app '#{options[:app].name}', the app metadata is read-only currently") unless v
 
-      enabled_languages = []
+      enabled_languages = options[:languages] || []
       LOCALISED_VERSION_VALUES.each do |key|
         current = options[key]
         next unless current && current.kind_of?(Hash)
         current.each do |language, value|
+          language = language.to_s
           enabled_languages << language unless enabled_languages.include?(language)
         end
       end
+
+      # Reject "default" language from getting enabled
+      # because "default" is not an iTC language
+      enabled_languages = enabled_languages.reject do |lang|
+        lang == "default"
+      end.uniq
 
       if enabled_languages.count > 0
         v.create_languages(enabled_languages)
@@ -198,10 +255,11 @@ module Deliver
       return if options[:skip_metadata]
 
       # Load localised data
-      Loader.language_folders(options[:metadata_path]).each do |lng_folder|
-        language = File.basename(lng_folder)
+      ignore_validation = options[:ignore_language_directory_validation]
+      Loader.language_folders(options[:metadata_path], ignore_validation).each do |lang_folder|
+        language = File.basename(lang_folder)
         (LOCALISED_VERSION_VALUES + LOCALISED_APP_VALUES).each do |key|
-          path = File.join(lng_folder, "#{key}.txt")
+          path = File.join(lang_folder, "#{key}.txt")
           next unless File.exist?(path)
 
           UI.message("Loading '#{path}'...")
@@ -244,6 +302,20 @@ module Deliver
 
     private
 
+    # Normalizes languages keys from symbols to strings
+    def normalize_language_keys(options)
+      (LOCALISED_VERSION_VALUES + LOCALISED_APP_VALUES).each do |key|
+        current = options[key]
+        next unless current && current.kind_of?(Hash)
+
+        current.keys.each do |language|
+          current[language.to_s] = current.delete(language)
+        end
+      end
+
+      options
+    end
+
     def set_trade_representative_contact_information(v, options)
       return unless options[:trade_representative_contact_information]
       info = options[:trade_representative_contact_information]
@@ -260,7 +332,7 @@ module Deliver
       UI.user_error!("`app_review_information` must be a hash", show_github_issues: true) unless info.kind_of?(Hash)
 
       REVIEW_INFORMATION_VALUES.each do |key, option_name|
-        v.send("#{key}=", info[option_name]) if info[option_name]
+        v.send("#{key}=", info[option_name].to_s.chomp) if info[option_name]
       end
       v.review_user_needed = (v.review_demo_user.to_s.chomp + v.review_demo_password.to_s.chomp).length > 0
     end

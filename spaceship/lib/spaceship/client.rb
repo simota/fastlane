@@ -6,17 +6,12 @@ require 'logger'
 require 'spaceship/babosa_fix'
 require 'spaceship/helper/net_http_generic_request'
 require 'spaceship/helper/plist_middleware'
+require 'spaceship/helper/rels_middleware'
 require 'spaceship/ui'
 require 'tmpdir'
 require 'cgi'
 
 Faraday::Utils.default_params_encoder = Faraday::FlatParamsEncoder
-
-if ENV["SPACESHIP_DEBUG"]
-  require 'openssl'
-  # this has to be on top of this file, since the value can't be changed later
-  OpenSSL::SSL::VERIFY_PEER = OpenSSL::SSL::VERIFY_NONE
-end
 
 module Spaceship
   # rubocop:disable Metrics/ClassLength
@@ -29,11 +24,18 @@ module Spaceship
     # The user that is currently logged in
     attr_accessor :user
 
+    # The email of the user that is currently logged in
+    attr_accessor :user_email
+
     # The logger in which all requests are logged
     # /tmp/spaceship[time]_[pid].log by default
     attr_accessor :logger
 
     attr_accessor :csrf_tokens
+
+    attr_accessor :provider
+
+    attr_accessor :available_providers
 
     # Base class for errors that want to present their message as
     # preferred error info for fastlane error handling. See:
@@ -205,15 +207,19 @@ module Spaceship
       #     invalid content provider id
       #
       available_teams = teams.collect do |team|
-        (team["contentProvider"] || {})["contentProviderId"]
+        {
+          team_id: (team["contentProvider"] || {})["contentProviderId"],
+          team_name: (team["contentProvider"] || {})["name"]
+        }
       end
 
-      result = available_teams.find do |available_team_id|
-        team_id.to_s == available_team_id.to_s
+      result = available_teams.find do |available_team|
+        team_id.to_s == available_team[:team_id].to_s
       end
 
       unless result
-        raise TunesClient::ITunesConnectError.new, "Could not set team ID to '#{team_id}', only found the following available teams: #{available_teams.join(', ')}"
+        error_string = "Could not set team ID to '#{team_id}', only found the following available teams:\n\n#{available_teams.map { |team| "- #{team[:team_id]} (#{team[:team_name]})" }.join("\n")}\n"
+        raise TunesClient::ITunesConnectError.new, error_string
       end
 
       response = request(:post) do |req|
@@ -258,12 +264,14 @@ module Spaceship
         c.response :xml, content_type: /\bxml$/
         c.response :plist, content_type: /\bplist$/
         c.use :cookie_jar, jar: @cookie
+        c.use FaradayMiddleware::RelsMiddleware
         c.adapter Faraday.default_adapter
 
         if ENV['SPACESHIP_DEBUG']
           # for debugging only
           # This enables tracking of networking requests using Charles Web Proxy
           c.proxy "https://127.0.0.1:8888"
+          c.ssl[:verify_mode] = OpenSSL::SSL::VERIFY_NONE
         end
 
         if ENV["DEBUG"]
@@ -484,7 +492,21 @@ module Spaceship
 
     # Get the `itctx` from the new (22nd May 2017) API endpoint "olympus"
     def fetch_olympus_session
-      request(:get, "https://olympus.itunes.apple.com/v1/session")
+      response = request(:get, "https://olympus.itunes.apple.com/v1/session")
+      body = response.body
+      if body
+        body = JSON.parse(body) if body.kind_of?(String)
+        user_map = body["user"]
+        if user_map
+          self.user_email = user_map["emailAddress"]
+        end
+
+        provider = body["provider"]
+        self.provider = Spaceship::Provider.new(provider_hash: provider)
+        self.available_providers = body["availableProviders"].map do |provider_hash|
+          Spaceship::Provider.new(provider_hash: provider_hash)
+        end
+      end
     end
 
     def itc_service_key
@@ -517,6 +539,7 @@ module Spaceship
     rescue \
         Faraday::Error::ConnectionFailed,
         Faraday::Error::TimeoutError,
+        Faraday::ParsingError, # <h2>Internal Server Error</h2> with content type json
         AppleTimeoutError,
         InternalServerError => ex # New Faraday version: Faraday::TimeoutError => ex
       tries -= 1
@@ -548,7 +571,7 @@ module Spaceship
       @csrf_tokens || {}
     end
 
-    def request(method, url_or_path = nil, params = nil, headers = {}, &block)
+    def request(method, url_or_path = nil, params = nil, headers = {}, auto_paginate = false, &block)
       headers.merge!(csrf_tokens)
       headers['User-Agent'] = USER_AGENT
 
@@ -561,7 +584,11 @@ module Spaceship
         params, headers = encode_params(params, headers)
       end
 
-      response = send_request(method, url_or_path, params, headers, &block)
+      response = if auto_paginate
+                   send_request_auto_paginate(method, url_or_path, params, headers, &block)
+                 else
+                   send_request(method, url_or_path, params, headers, &block)
+                 end
 
       log_response(method, url_or_path, response)
 
@@ -604,6 +631,10 @@ module Spaceship
       # Check if the failure is due to missing permissions (iTunes Connect)
       if body["messages"] && body["messages"]["error"].include?("Forbidden")
         raise_insuffient_permission_error!
+      elsif body["messages"] && body["messages"]["error"].include?("insufficient privileges")
+        # Passing a specific `caller_location` here to make sure we return the correct method
+        # With the default location the error would say that `parse_response` is the caller
+        raise_insuffient_permission_error!(caller_location: 3)
       elsif body.to_s.include?("Internal Server Error - Read")
         raise InternalServerError, "Received an internal server error from iTunes Connect / Developer Portal, please try again later"
       elsif (body["resultString"] || "").include?("Program License Agreement")
@@ -612,20 +643,16 @@ module Spaceship
     end
 
     # This also gets called from subclasses
-    def raise_insuffient_permission_error!(additional_error_string: nil)
+    def raise_insuffient_permission_error!(additional_error_string: nil, caller_location: 2)
       # get the method name of the request that failed
       # `block in` is used very often for requests when surrounded for paging or retrying blocks
       # The ! is part of some methods when they modify or delete a resource, so we don't want to show it
       # Using `sub` instead of `delete` as we don't want to allow multiple matches
-      calling_method_name = caller_locations(2, 2).first.label.sub("block in", "").delete("!").strip
-      begin
-        team_id = "(Team ID #{self.team_id}) "
-      rescue
-        # Showing the team ID is something that's nice to have, however it might cause an exception
-        # when the user doesn't have any permission at all (e.g. failing at login)
-        # we still want the error message to show the actual string, but without the team_id in that case
-        team_id = ""
-      end
+      calling_method_name = caller_locations(caller_location, 2).first.label.sub("block in", "").delete("!").strip
+
+      # calling the computed property self.team_id can get us into an exception handling loop
+      team_id = @current_team_id ? "(Team ID #{@current_team_id}) " : ""
+
       error_message = "User #{self.user} #{team_id}doesn't have enough permission for the following action: #{calling_method_name}"
       error_message += " (#{additional_error_string})" if additional_error_string.to_s.length > 0
       raise InsufficientPermissions, error_message
@@ -682,10 +709,26 @@ module Spaceship
         end
 
         if response.body.to_s.include?("<title>302 Found</title>")
-          raise AppleTimeoutError.new, "Apple 302 detected"
+          raise AppleTimeoutError.new, "Apple 302 detected - this might be temporary server error, check https://developer.apple.com/system-status/ to see if there is a known downtime"
         end
         return response
       end
+    end
+
+    def send_request_auto_paginate(method, url_or_path, params, headers, &block)
+      response = send_request(method, url_or_path, params, headers, &block)
+      return response unless should_process_next_rel?(response)
+      last_response = response
+      while last_response.env.rels[:next]
+        last_response = send_request(method, last_response.env.rels[:next], params, headers, &block)
+        break unless should_process_next_rel?(last_response)
+        response.body['data'].concat(last_response.body['data'])
+      end
+      response
+    end
+
+    def should_process_next_rel?(response)
+      response.body.kind_of?(Hash) && response.body['data'].kind_of?(Array)
     end
 
     def encode_params(params, headers)

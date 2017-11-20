@@ -22,7 +22,7 @@ bundle exec fastlane beta --verbose
 If you need the breakpoint when running tests, make sure to have the `DEBUG` environment variable set, as the default test runner will remove all output from stdout, and therefore not showing the output of `pry`:
 
 ```
-DEBUG= bundle exec rspec
+DEBUG=1 bundle exec rspec
 ```
 
 You will then jump into an interactive debugger that allows you to print out variables, call methods and [much more](https://github.com/pry/pry/wiki).
@@ -121,16 +121,16 @@ They key is to do the same action you want to test on both the website, and in _
 
 To pipe _spaceship_ requests through your local proxy, you need to set an environment variable:
 ```
-SPACESHIP_DEBUG=1 spaceship
+SPACESHIP_DEBUG=1 bundle exec fastlane spaceship
 ```
 
-To make it easier to run the same script again, you can temporarily edit the `spaceship/Rakefile` to look like this:
+To make it easier to run the same script again, you can temporarily edit the `Rakefile` to look like this:
 
 ```ruby
 # leave existing code, and append the following
 
 task :debug do
-  require ‘spaceship’
+  require 'spaceship'
 
   # first login
   Spaceship::Tunes.login("apple@fastlane.tools") # use your own test account
@@ -145,10 +145,10 @@ task :debug do
 end
 ```
 
-To run the newly created script, `cd` into the _spaceship_ directory and run
+To run the newly created script, run
 
 ```
-FASTLANE_DEBUG=1 fastlane debug
+SPACESHIP_DEBUG=1 bundle exec rake debug
 ```
 
 <!--Links-->

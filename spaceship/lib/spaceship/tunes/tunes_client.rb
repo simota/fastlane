@@ -10,6 +10,10 @@ module Spaceship
     class ITunesConnectTemporaryError < ITunesConnectError
     end
 
+    # raised if the server failed to save, and it might be caused by an invisible server error
+    class ITunesConnectPotentialServerError < ITunesConnectError
+    end
+
     attr_reader :du_client
 
     def initialize
@@ -25,6 +29,7 @@ module Spaceship
             'iphone4' => [1136, 640],
             'iphone6' => [1334, 750],
             'iphone6Plus' => [2208, 1242],
+            'iphone58' => [2436, 1125],
             'ipad' => [1024, 768],
             'ipadPro' => [2732, 2048]
         }
@@ -86,6 +91,12 @@ module Spaceship
           puts "#{i + 1}) \"#{team['contentProvider']['name']}\" (#{team['contentProvider']['contentProviderId']})"
         end
 
+        unless Spaceship::Client::UserInterface.interactive?
+          puts "Multiple teams found on iTunes Connect, Your Terminal is running in non-interactive mode! Cannot continue from here."
+          puts "Please check that you set FASTLANE_ITC_TEAM_ID or FASTLANE_ITC_TEAM_NAME to the right value."
+          raise "Multiple iTunes Connect Teams found; unable to choose, terminal not ineractive!"
+        end
+
         selected = ($stdin.gets || '').strip.to_i - 1
         team_to_use = teams[selected] if selected >= 0
 
@@ -101,18 +112,49 @@ module Spaceship
       send_shared_login_request(user, password)
     end
 
+    # Sometimes we get errors or info nested in our data
+    # This method allows you to pass in a set of keys to check for
+    # along with the name of the sub_section of your original data
+    # where we should check
+    # Returns a mapping of keys to data array if we find anything, otherwise, empty map
+    def fetch_errors_in_data(data_section: nil, sub_section_name: nil, keys: nil)
+      if data_section && sub_section_name
+        sub_section = data_section[sub_section_name]
+      else
+        sub_section = data_section
+      end
+
+      unless sub_section
+        return {}
+      end
+
+      error_map = {}
+      keys.each do |key|
+        errors = sub_section.fetch(key, [])
+        error_map[key] = errors if errors.count > 0
+      end
+      return error_map
+    end
+
     # rubocop:disable Metrics/PerceivedComplexity
-    def handle_itc_response(raw)
+    # If the response is coming from a flaky api, set flaky_api_call to true so we retry a little.
+    # Patience is a virtue.
+    def handle_itc_response(raw, flaky_api_call: false)
       return unless raw
       return unless raw.kind_of? Hash
 
       data = raw['data'] || raw # sometimes it's with data, sometimes it isn't
+      error_keys_to_check = [
+        "sectionErrorKeys",
+        "sectionInfoKeys",
+        "sectionWarningKeys",
+        "validationErrors"
+      ]
+      errors_in_data = fetch_errors_in_data(data_section: data, keys: error_keys_to_check)
+      errors_in_version_info = fetch_errors_in_data(data_section: data, sub_section_name: "versionInfo", keys: error_keys_to_check)
 
-      if data.fetch('sectionErrorKeys', []).count == 0 and
-         data.fetch('sectionInfoKeys', []).count == 0 and
-         data.fetch('sectionWarningKeys', []).count == 0 and
-         data.fetch('validationErrors', []).count == 0
-
+      # If we have any errors or "info" we need to treat them as warnings or errors
+      if errors_in_data.count == 0 && errors_in_version_info.count == 0
         logger.debug("Request was successful")
       end
 
@@ -142,8 +184,15 @@ module Spaceship
       end
 
       errors = handle_response_hash.call(data)
-      errors += data.fetch('sectionErrorKeys', [])
-      errors += data.fetch('validationErrors', [])
+
+      # Search at data level, as well as "versionInfo" level for errors
+      error_keys = ["sectionErrorKeys", "validationErrors"]
+      errors_in_data = fetch_errors_in_data(data_section: data, keys: error_keys)
+      errors_in_version_info = fetch_errors_in_data(data_section: data, sub_section_name: "versionInfo", keys: error_keys)
+
+      errors += errors_in_data.values if errors_in_data.values
+      errors += errors_in_version_info.values if errors_in_version_info.values
+      errors = errors.flat_map { |value| value }
 
       # Sometimes there is a different kind of error in the JSON response
       # e.g. {"warn"=>nil, "error"=>["operation_failed"], "info"=>nil}
@@ -158,13 +207,25 @@ module Spaceship
           raise ITunesConnectTemporaryError.new, errors.first
         elsif errors.count == 1 and errors.first.include?("Forbidden")
           raise_insuffient_permission_error!
+        elsif flaky_api_call
+          raise ITunesConnectPotentialServerError.new, errors.join(' ')
         else
           raise ITunesConnectError.new, errors.join(' ')
         end
       end
 
-      puts data['sectionInfoKeys'] if data['sectionInfoKeys']
-      puts data['sectionWarningKeys'] if data['sectionWarningKeys']
+      # Search at data level, as well as "versionInfo" level for info and warnings
+      info_keys = ["sectionInfoKeys", "sectionWarningKeys"]
+      info_in_data = fetch_errors_in_data(data_section: data, keys: info_keys)
+      info_in_version_info = fetch_errors_in_data(data_section: data, sub_section_name: "versionInfo", keys: info_keys)
+
+      info_in_data.each do |info_key, info_value|
+        puts(info_value)
+      end
+
+      info_in_version_info.each do |info_key, info_value|
+        puts(info_value)
+      end
 
       return data
     end
@@ -204,7 +265,7 @@ module Spaceship
     # @param sku (String): A unique ID for your app that is not visible on the App Store.
     # @param bundle_id (String): The bundle ID must match the one you used in Xcode. It
     #   can't be changed after you submit your first build.
-    def create_application!(name: nil, primary_language: nil, version: nil, sku: nil, bundle_id: nil, bundle_id_suffix: nil, company_name: nil, platform: nil)
+    def create_application!(name: nil, primary_language: nil, version: nil, sku: nil, bundle_id: nil, bundle_id_suffix: nil, company_name: nil, platform: nil, itunes_connect_users: nil)
       puts "The `version` parameter is deprecated. Use `Spaceship::Tunes::Application.ensure_version!` method instead" if version
 
       # First, we need to fetch the data from Apple, which we then modify with the user's values
@@ -226,6 +287,11 @@ module Spaceship
 
       data['initialPlatform'] = platform
       data['enabledPlatformsForCreation'] = { value: [platform] }
+
+      unless itunes_connect_users.nil?
+        data['iTunesConnectUsers']['grantedAllUsers'] = false
+        data['iTunesConnectUsers']['grantedUsers'] = data['iTunesConnectUsers']['availableUsers'].select { |user| itunes_connect_users.include? user['username'] }
+      end
 
       # Now send back the modified hash
       r = request(:post) do |req|
@@ -258,22 +324,28 @@ module Spaceship
       parse_response(r, 'data')
     end
 
-    def get_ratings(app_id, platform, versionId = '', storefront = '')
-      # if storefront or versionId is empty api fails
+    def get_ratings(app_id, platform, version_id = '', storefront = '')
+      # if storefront or version_id is empty api fails
       rating_url = "ra/apps/#{app_id}/platforms/#{platform}/reviews/summary?"
       rating_url << "storefront=#{storefront}" unless storefront.empty?
-      rating_url << "versionId=#{versionId}" unless versionId.empty?
+      rating_url << "version_id=#{version_id}" unless version_id.empty?
 
       r = request(:get, rating_url)
       parse_response(r, 'data')
     end
 
-    def get_reviews(app_id, platform, storefront, versionId = '')
+    def get_reviews(app_id, platform, storefront, version_id)
       index = 0
       per_page = 100 # apple default
       all_reviews = []
       loop do
-        r = request(:get, "ra/apps/#{app_id}/platforms/#{platform}/reviews?storefront=#{storefront}&versionId=#{versionId}&index=#{index}")
+        rating_url = "ra/apps/#{app_id}/platforms/#{platform}/reviews?"
+        rating_url << "sort=REVIEW_SORT_ORDER_MOST_RECENT"
+        rating_url << "&index=#{index}"
+        rating_url << "&storefront=#{storefront}" unless storefront.empty?
+        rating_url << "&version_id=#{version_id}" unless version_id.empty?
+
+        r = request(:get, rating_url)
         all_reviews.concat(parse_response(r, 'data')['reviews'])
         if all_reviews.count < parse_response(r, 'data')['reviewCount']
           index += per_page
@@ -331,7 +403,7 @@ module Spaceship
           req.headers['Content-Type'] = 'application/json'
         end
 
-        handle_itc_response(r.body)
+        handle_itc_response(r.body, flaky_api_call: true)
       end
     end
 
@@ -390,6 +462,37 @@ module Spaceship
       # send the changes back to Apple
       r = request(:post) do |req|
         req.url "ra/users/itc/create"
+        req.body = data.to_json
+        req.headers['Content-Type'] = 'application/json'
+      end
+      handle_itc_response(r.body)
+    end
+
+    def update_member_roles!(member, roles: [], apps: [])
+      r = request(:get, "ra/users/itc/#{member.user_id}/roles")
+      data = parse_response(r, 'data')
+
+      roles << "admin" if roles.length == 0
+
+      data["user"]["roles"] = []
+      roles.each do |role|
+        # find role from template
+        data["roles"].each do |template_role|
+          if template_role["value"]["name"] == role
+            data["user"]["roles"] << template_role
+          end
+        end
+      end
+
+      if apps.length == 0
+        data["user"]["userSoftwares"] = { value: { grantAllSoftware: true, grantedSoftwareAdamIds: [] } }
+      else
+        data["user"]["userSoftwares"] = { value: { grantAllSoftware: false, grantedSoftwareAdamIds: apps } }
+      end
+
+      # send the changes back to Apple
+      r = request(:post) do |req|
+        req.url "ra/users/itc/#{member.user_id}/roles"
         req.body = data.to_json
         req.headers['Content-Type'] = 'application/json'
       end
@@ -528,6 +631,14 @@ module Spaceship
       parse_response(r, 'data')
     end
 
+    def available_languages
+      r = request(:get, "ra/apps/storePreview/regionCountryLanguage")
+      response = parse_response(r, 'data')
+      response.flat_map { |region| region["storeFronts"] }
+              .flat_map { |storefront| storefront["supportedLocaleCodes"] }
+              .uniq
+    end
+
     #####################################################
     # @!group App Icons
     #####################################################
@@ -556,9 +667,21 @@ module Spaceship
     # Uploads an In-App-Purchase Review screenshot
     # @param app_id (AppId): The id of the app
     # @param upload_image (UploadFile): The icon to upload
-    # @return [JSON] the response
+    # @return [JSON] the screenshot data, ready to be added to an In-App-Purchase
     def upload_purchase_review_screenshot(app_id, upload_image)
-      du_client.upload_purchase_review_screenshot(app_id, upload_image, content_provider_id, sso_token_for_image)
+      data = du_client.upload_purchase_review_screenshot(app_id, upload_image, content_provider_id, sso_token_for_image)
+      {
+          "value" => {
+              "assetToken" => data["token"],
+              "sortOrder" => 0,
+              "type" => du_client.get_picture_type(upload_image),
+              "originalFileName" => upload_image.file_name,
+              "size" => data["length"],
+              "height" => data["height"],
+              "width" => data["width"],
+              "checksum" => data["md5"]
+          }
+      }
     end
 
     # Uploads a screenshot
@@ -613,12 +736,14 @@ module Spaceship
     # Uploads the trailer preview
     # @param app_version (AppVersion): The version of your app
     # @param upload_trailer_preview (UploadFile): The trailer preview to upload
+    # @param device (string): The target device
     # @return [JSON] the response
-    def upload_trailer_preview(app_version, upload_trailer_preview)
+    def upload_trailer_preview(app_version, upload_trailer_preview, device)
       raise "app_version is required" unless app_version
       raise "upload_trailer_preview is required" unless upload_trailer_preview
+      raise "device is required" unless device
 
-      du_client.upload_trailer_preview(app_version, upload_trailer_preview, content_provider_id, sso_token_for_image)
+      du_client.upload_trailer_preview(app_version, upload_trailer_preview, content_provider_id, sso_token_for_image, device)
     end
 
     # Fetches the App Version Reference information from ITC
@@ -780,7 +905,7 @@ module Spaceship
       build_info = get_build_info_for_review(app_id: app_id, train: train, build_number: build_number, platform: platform)
       # Now fill in the values provided by the user
 
-      # First the localised values:
+      # First the localized values:
       build_info['details'].each do |current|
         current['whatsNew']['value'] = changelog if changelog
         current['description']['value'] = description if description
@@ -852,19 +977,25 @@ module Spaceship
       parse_response(r, 'data')
     end
 
-    def send_app_submission(app_id, data)
+    def send_app_submission(app_id, version, data)
       raise "app_id is required" unless app_id
 
       # ra/apps/1039164429/version/submit/complete
       r = request(:post) do |req|
-        req.url "ra/apps/#{app_id}/version/submit/complete"
+        req.url "ra/apps/#{app_id}/versions/#{version}/submit/complete"
         req.body = data.to_json
         req.headers['Content-Type'] = 'application/json'
       end
 
       handle_itc_response(r.body)
 
-      if r.body.fetch('messages').fetch('info').last == "Successful POST"
+      # iTunes Connect still returns a success status code even the submission
+      # was failed because of Ad ID info.  This checks for any section error
+      # keys in returned adIdInfo and prints them out.
+      ad_id_error_keys = r.body.fetch('data').fetch('adIdInfo').fetch('sectionErrorKeys')
+      if ad_id_error_keys.any?
+        raise "Something wrong with your Ad ID information: #{ad_id_error_keys}."
+      elsif r.body.fetch('messages').fetch('info').last == "Successful POST"
         # success
       else
         raise "Something went wrong when submitting the app for review. Make sure to pass valid options to submit your app for review"
@@ -1034,20 +1165,7 @@ module Spaceship
         # Upload Screenshot:
         upload_file = UploadFile.from_path review_screenshot
         screenshot_data = upload_purchase_review_screenshot(app_id, upload_file)
-        new_screenshot = {
-          "value" => {
-            "assetToken" => screenshot_data["token"],
-            "sortOrder" => 0,
-            "type" => "SortedScreenShot",
-            "originalFileName" => upload_file.file_name,
-            "size" => screenshot_data["length"],
-            "height" => screenshot_data["height"],
-            "width" => screenshot_data["width"],
-            "checksum" => screenshot_data["md5"]
-          }
-        }
-
-        data["versions"][0]["reviewScreenshot"] = new_screenshot
+        data["versions"][0]["reviewScreenshot"] = screenshot_data
       end
 
       # Now send back the modified hash
@@ -1289,7 +1407,7 @@ module Spaceship
 
     private
 
-    def with_tunes_retry(tries = 5, &_block)
+    def with_tunes_retry(tries = 5, potential_server_error_tries = 3, &_block)
       return yield
     rescue Spaceship::TunesClient::ITunesConnectTemporaryError => ex
       unless (tries -= 1).zero?
@@ -1300,6 +1418,15 @@ module Spaceship
         retry
       end
       raise ex # re-raise the exception
+    rescue Spaceship::TunesClient::ITunesConnectPotentialServerError => ex
+      unless (potential_server_error_tries -= 1).zero?
+        msg = "Potential server error received: '#{ex.message}'. Retrying after 10 seconds (remaining: #{tries})..."
+        puts msg
+        logger.warn msg
+        sleep 10 unless defined? SpecHelper # unless FastlaneCore::Helper.is_test?
+        retry
+      end
+      raise ex
     end
 
     def clear_user_cached_data

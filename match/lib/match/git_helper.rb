@@ -1,5 +1,7 @@
 module Match
   class GitHelper
+    MATCH_VERSION_FILE_NAME = "match_version.txt"
+
     def self.clone(git_url,
                    shallow_clone,
                    manual_password: nil,
@@ -38,6 +40,9 @@ module Match
                                         print_command: FastlaneCore::Globals.verbose?)
       rescue
         UI.error("Error cloning certificates repo, please make sure you have read access to the repository you want to use")
+        if branch && clone_branch_directly
+          UI.error("You passed '#{branch}' as branch in combination with the `clone_branch_directly` flag. Please remove `clone_branch_directly` flag on the first run for _match_ to create the branch.")
+        end
         UI.error("Run the following command manually to make sure you're properly authenticated:")
         UI.command(command)
         UI.user_error!("Error cloning certificates git repo, please make sure you have access to the repository - see instructions above")
@@ -59,7 +64,6 @@ module Match
         return self.clone(git_url, shallow_clone)
       end
 
-      copy_readme(@dir) unless skip_docs
       Encrypt.new.decrypt_repo(path: @dir, git_url: git_url, manual_password: manual_password)
 
       return @dir
@@ -77,21 +81,45 @@ module Match
     end
 
     def self.match_version(workspace)
-      path = File.join(workspace, "match_version.txt")
+      path = File.join(workspace, MATCH_VERSION_FILE_NAME)
       if File.exist?(path)
         Gem::Version.new(File.read(path))
       end
     end
 
-    def self.commit_changes(path, message, git_url, branch = "master")
+    def self.commit_changes(path, message, git_url, branch = "master", files_to_commmit = nil)
+      files_to_commmit ||= []
       Dir.chdir(path) do
         return if `git status`.include?("nothing to commit")
 
         Encrypt.new.encrypt_repo(path: path, git_url: git_url)
-        File.write("match_version.txt", Fastlane::VERSION) # unencrypted
-
         commands = []
-        commands << "git add -A"
+
+        if files_to_commmit.count > 0 # e.g. for nuke this is treated differently
+          if !File.exist?(MATCH_VERSION_FILE_NAME) || File.read(MATCH_VERSION_FILE_NAME) != Fastlane::VERSION.to_s
+            files_to_commmit << MATCH_VERSION_FILE_NAME
+            File.write(MATCH_VERSION_FILE_NAME, Fastlane::VERSION) # stored unencrypted
+          end
+
+          template = File.read("#{Match::ROOT}/lib/assets/READMETemplate.md")
+          readme_path = "README.md"
+          if !File.exist?(readme_path) || File.read(readme_path) != template
+            files_to_commmit << readme_path
+            File.write(readme_path, template)
+          end
+
+          # `git add` each file we want to commit
+          #   - Fixes https://github.com/fastlane/fastlane/issues/8917
+          #   - Fixes https://github.com/fastlane/fastlane/issues/8793
+          #   - Replaces, closes and fixes https://github.com/fastlane/fastlane/pull/8919
+          commands += files_to_commmit.map do |current_file|
+            "git add #{current_file.shellescape}"
+          end
+        else
+          # No specific list given, e.g. this happens on `fastlane match nuke`
+          # We just want to run `git add -A` to commit everything
+          commands << "git add -A"
+        end
         commands << "git commit -m #{message.shellescape}"
         commands << "GIT_TERMINAL_PROMPT=0 git push origin #{branch.shellescape}"
 
@@ -153,12 +181,6 @@ module Match
                                               print_command: FastlaneCore::Globals.verbose?)
       end
       return !result.empty?
-    end
-
-    # Copies the README.md into the git repo
-    def self.copy_readme(directory)
-      template = File.read("#{Match::ROOT}/lib/assets/READMETemplate.md")
-      File.write(File.join(directory, "README.md"), template)
     end
 
     def self.add_user_config(user_name, user_email)

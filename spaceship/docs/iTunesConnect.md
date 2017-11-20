@@ -58,7 +58,7 @@ details.save!
 To change the price of the app (it's not necessary to call `save!` when updating the price)
 
 ```ruby
-version.update_price_tier("3")
+app.update_price_tier!("3")
 ```
 
 ## AppVersions
@@ -91,7 +91,7 @@ v.copyright = "#{Time.now.year} Felix Krause"
 # Get a list of available languages for this app
 v.description.languages # => ["German", "English"]
 
-# Update localised app metadata
+# Update localized app metadata
 v.description["en-US"] = "App Description"
 
 # set the app age rating
@@ -129,6 +129,7 @@ attr_accessor :can_reject_version
 attr_accessor :can_prepare_for_upload
 attr_accessor :can_send_version_live
 attr_accessor :release_on_approval
+attr_accessor :ratings_reset
 attr_accessor :can_beta_test
 attr_accessor :supports_apple_watch
 attr_accessor :app_icon_url
@@ -294,24 +295,12 @@ tester = Spaceship::Tunes::Tester::Internal.find("felix@krausefx.com")
 # Same for external testers
 tester = Spaceship::Tunes::Tester::External.find("guest@krausefx.com")
 
-# Find all testers that were already added to an application
-app.external_testers            # => Array of all external testers for this application
-
-
 # Creating new external testers
 Spaceship::Tunes::Tester::External.create!(email: "github@krausefx.com",
                                       first_name: "Felix",
                                        last_name: "Krause",
                                           groups: ["spaceship"])
-
-# Add all external testers to an application
-app.add_all_testers!
-
-# Only add selected testers to an application
-# This will add the existing tester (if available) or create a new one
-app.add_external_tester!(email: "github@krausefx.com", first_name: "Felix", last_name: "Krause")
 ```
-
 Right now, `spaceship` can't modify or create internal testers.
 
 ```ruby
@@ -341,16 +330,13 @@ Spaceship::Tunes::SandboxTester.delete_all!
 ratings = app.ratings # => Spaceship::Tunes::AppRatings
 
 # Get the number of 5 star ratings
-five_star_count = ratings.rating_summary.five_star_rating_count
+five_star_count = ratings.five_star_rating_count
 
 # Find the average rating across all stores
-average_rating = ratings.rating_summary.average_rating
-
-# List store fronts the app is available in
-ratings.store_fronts # => Hash of country code to Spaceship::Tunes::AppRatingSummary
+average_rating = ratings.average_rating
 
 # Find the average rating for a given store front
-average_rating = ratings.store_fronts["US"].average_rating
+average_rating = app.ratings(storefront: "US").average_rating
 
 # Get reviews for a given store front
 reviews = ratings.reviews("US") # => Array of hashes representing review data

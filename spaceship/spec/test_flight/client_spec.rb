@@ -79,6 +79,15 @@ describe Spaceship::TestFlight::Client do
       subject.get_builds_for_train(app_id: app_id, platform: platform, train_version: '1.0')
       expect(WebMock).to have_requested(:get, 'https://itunesconnect.apple.com/testflight/v2/providers/fake-team-id/apps/some-app-id/platforms/ios/trains/1.0/builds')
     end
+
+    it 'retries requests' do
+      allow(subject).to receive(:request) { raise Faraday::ParsingError, 'Boom!' }
+      expect(subject).to receive(:request).exactly(2).times
+      begin
+        subject.get_builds_for_train(app_id: app_id, platform: platform, train_version: '1.0', retry_count: 2)
+      rescue
+      end
+    end
   end
 
   ##
@@ -99,6 +108,15 @@ describe Spaceship::TestFlight::Client do
       MockAPI::TestFlightServer.put('/testflight/v2/providers/fake-team-id/apps/some-app-id/builds/1') {}
       subject.put_build(app_id: app_id, build_id: 1, build: build)
       expect(WebMock).to have_requested(:put, 'https://itunesconnect.apple.com/testflight/v2/providers/fake-team-id/apps/some-app-id/builds/1')
+    end
+  end
+
+  context '#expire_build' do
+    let(:build) { double('Build', to_json: "") }
+    it 'executes the request' do
+      MockAPI::TestFlightServer.post('/testflight/v2/providers/fake-team-id/apps/some-app-id/builds/1/expire') {}
+      subject.expire_build(app_id: app_id, build_id: 1, build: build)
+      expect(WebMock).to have_requested(:post, 'https://itunesconnect.apple.com/testflight/v2/providers/fake-team-id/apps/some-app-id/builds/1/expire')
     end
   end
 
@@ -130,7 +148,15 @@ describe Spaceship::TestFlight::Client do
     it 'executes the request' do
       MockAPI::TestFlightServer.get('/testflight/v2/providers/fake-team-id/apps/some-app-id/testers') {}
       subject.testers_for_app(app_id: app_id)
-      expect(WebMock).to have_requested(:get, 'https://itunesconnect.apple.com/testflight/v2/providers/fake-team-id/apps/some-app-id/testers?limit=10000')
+      expect(WebMock).to have_requested(:get, 'https://itunesconnect.apple.com/testflight/v2/providers/fake-team-id/apps/some-app-id/testers?limit=40&order=asc&sort=email')
+    end
+  end
+
+  context '#search_for_tester_in_app' do
+    it 'executes the request' do
+      MockAPI::TestFlightServer.get('/testflight/v2/providers/fake-team-id/apps/some-app-id/testers') {}
+      subject.search_for_tester_in_app(app_id: app_id, text: "fake+tester+text")
+      expect(WebMock).to have_requested(:get, 'https://itunesconnect.apple.com/testflight/v2/providers/fake-team-id/apps/some-app-id/testers?order=asc&search=fake%2Btester%2Btext&sort=status')
     end
   end
 
@@ -151,11 +177,17 @@ describe Spaceship::TestFlight::Client do
     end
   end
 
-  context '#put_tester_to_group' do
+  context '#post_tester_to_group' do
     it 'executes the request' do
-      MockAPI::TestFlightServer.put('/testflight/v2/providers/fake-team-id/apps/some-app-id/groups/fake-group-id/testers/fake-tester-id') {}
-      subject.put_tester_to_group(app_id: app_id, tester_id: 'fake-tester-id', group_id: 'fake-group-id')
-      expect(WebMock).to have_requested(:put, 'https://itunesconnect.apple.com/testflight/v2/providers/fake-team-id/apps/some-app-id/groups/fake-group-id/testers/fake-tester-id')
+      MockAPI::TestFlightServer.post('/testflight/v2/providers/fake-team-id/apps/some-app-id/groups/fake-group-id/testers') {}
+      tester = OpenStruct.new({ first_name: "Josh", last_name: "Taquitos", email: "taquitos@google.com" })
+      subject.post_tester_to_group(app_id: app_id,
+                                    email: tester.email,
+                               first_name: tester.first_name,
+                                last_name: tester.last_name,
+                                 group_id: 'fake-group-id')
+      expect(WebMock).to have_requested(:post, 'https://itunesconnect.apple.com/testflight/v2/providers/fake-team-id/apps/some-app-id/groups/fake-group-id/testers').
+        with(body: '[{"email":"taquitos@google.com","firstName":"Josh","lastName":"Taquitos"}]')
     end
   end
 
